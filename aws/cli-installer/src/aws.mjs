@@ -43,6 +43,7 @@ import {
   printWarning,
   printInfo,
   createSpinner,
+  createAsciiAnimation,
 } from './ui.mjs';
 import chalk from 'chalk';
 import { randomBytes } from 'node:crypto';
@@ -145,11 +146,20 @@ export async function checkRequirements(cfg) {
   }
 
   cfg.accountId = identity.Account;
-  // Extract the IAM role ARN from the caller identity for FGAC and OpenSearch UI access
-  // identity.Arn is like arn:aws:sts::123:assumed-role/RoleName/session
-  const arnMatch = identity.Arn.match(/assumed-role\/([^/]+)\//);
-  if (arnMatch) {
-    cfg.callerRoleArn = `arn:aws:iam::${cfg.accountId}:role/${arnMatch[1]}`;
+  // Extract the caller's IAM principal for FGAC mapping.
+  // Handles: assumed-role, IAM user, federated user, and root.
+  const arn = identity.Arn;
+  const assumedMatch = arn.match(/assumed-role\/([^/]+)\//);
+  const userMatch = arn.match(/:user\/(.+)$/);
+  const fedMatch = arn.match(/:federated-user\/(.+)$/);
+  if (assumedMatch) {
+    cfg.callerPrincipal = { arn: `arn:aws:iam::${cfg.accountId}:role/${assumedMatch[1]}`, type: 'role' };
+  } else if (userMatch) {
+    cfg.callerPrincipal = { arn, type: 'user' };
+  } else if (fedMatch) {
+    cfg.callerPrincipal = { arn, type: 'user' };
+  } else if (arn.endsWith(':root')) {
+    cfg.callerPrincipal = { arn, type: 'user' };
   }
   printSuccess(`Authenticated — account ${cfg.accountId}`);
   printInfo(`Identity: ${identity.Arn}`);
@@ -252,9 +262,12 @@ async function createManagedDomain(cfg) {
   // Poll for endpoint
   const spinner = createSpinner('Provisioning OpenSearch domain (20-30 min)...');
   spinner.start();
+  const anim = createAsciiAnimation('opensearch');
+  anim.start(spinner);
   const maxWait = 1800_000; // 30 min
   const interval = 10_000;
   const start = Date.now();
+  anim.setStatus(() => `Provisioning OpenSearch domain... (${fmtElapsed(Math.round((Date.now() - start) / 1000))} elapsed)`);
 
   while (Date.now() - start < maxWait) {
     try {
@@ -262,15 +275,16 @@ async function createManagedDomain(cfg) {
       const endpoint = desc.DomainStatus?.Endpoint;
       if (endpoint) {
         cfg.opensearchEndpoint = `https://${endpoint}`;
-        spinner.succeed(`Domain ready: ${cfg.opensearchEndpoint}`);
+        anim.stop();
+        spinner.succeed(`Domain ready: ${cfg.opensearchEndpoint} (${fmtElapsed(Math.round((Date.now() - start) / 1000))})`);
         return;
       }
     } catch { /* keep polling */ }
-    await sleepWithTicker(interval, spinner, start,
-      (s) => `Provisioning OpenSearch domain... (${fmtElapsed(s)} elapsed)`);
+    await sleep(interval);
   }
 
-  spinner.fail('Timed out waiting for OpenSearch domain');
+  anim.stop();
+  spinner.fail(`Timed out waiting for OpenSearch domain (${fmtElapsed(Math.round((Date.now() - start) / 1000))})`);
   throw new Error('Timed out waiting for OpenSearch domain');
 }
 
@@ -296,11 +310,16 @@ export async function mapOsiRoleInDomain(cfg) {
   const url = `${cfg.opensearchEndpoint}/_plugins/_security/api/rolesmapping`;
   const auth = Buffer.from(`${cfg.opensearchUser || 'admin'}:${masterPass}`).toString('base64');
 
-  // Map both the OSI pipeline role and the caller's role (for OpenSearch UI access)
-  const callerRoleArn = cfg.callerRoleArn || '';
-  const newRoles = [cfg.iamRoleArn];
-  if (callerRoleArn && callerRoleArn !== cfg.iamRoleArn) {
-    newRoles.push(callerRoleArn);
+  // Map both the OSI pipeline role and the caller's principal (for OpenSearch UI access)
+  const callerPrincipal = cfg.callerPrincipal; // { arn, type: 'role'|'user' }
+  const newBackendRoles = [cfg.iamRoleArn];
+  const newUsers = [];
+  if (callerPrincipal && callerPrincipal.arn !== cfg.iamRoleArn) {
+    if (callerPrincipal.type === 'role') {
+      newBackendRoles.push(callerPrincipal.arn);
+    } else {
+      newUsers.push(callerPrincipal.arn);
+    }
   }
 
   // Map to both all_access and security_manager for full permissions (including PPL)
@@ -312,19 +331,25 @@ export async function mapOsiRoleInDomain(cfg) {
     for (const role of rolesToMap) {
       const roleUrl = `${url}/${role}`;
       const getResp = await fetch(roleUrl, { headers });
-      let existing = [];
+      let existingBackendRoles = [];
+      let existingUsers = [];
       if (getResp.ok) {
         const data = await getResp.json();
-        existing = data?.[role]?.backend_roles || [];
+        existingBackendRoles = data?.[role]?.backend_roles || [];
+        existingUsers = data?.[role]?.users || [];
       }
-      const merged = [...new Set([...existing, ...newRoles])];
+      const mergedBackendRoles = [...new Set([...existingBackendRoles, ...newBackendRoles])];
+      const mergedUsers = [...new Set([...existingUsers, ...newUsers])];
+
+      const ops = [{ op: 'add', path: '/backend_roles', value: mergedBackendRoles }];
+      if (newUsers.length) {
+        ops.push({ op: 'add', path: '/users', value: mergedUsers });
+      }
 
       const resp = await fetch(roleUrl, {
         method: 'PATCH',
         headers,
-        body: JSON.stringify([
-          { op: 'add', path: '/backend_roles', value: merged },
-        ]),
+        body: JSON.stringify(ops),
       });
 
       if (!resp.ok) {
@@ -535,8 +560,11 @@ export async function createOsiPipeline(cfg, pipelineYaml) {
   // Wait for pipeline to become active
   const spinner = createSpinner('Waiting for pipeline to activate...');
   spinner.start();
+  const anim = createAsciiAnimation('pipeline');
+  anim.start(spinner);
   const maxWait = 1200_000; // 20 min
   const start = Date.now();
+  anim.setStatus(() => `Waiting for pipeline... (${fmtElapsed(Math.round((Date.now() - start) / 1000))})`);
 
   while (Date.now() - start < maxWait) {
     try {
@@ -545,7 +573,8 @@ export async function createOsiPipeline(cfg, pipelineYaml) {
       if (status === 'ACTIVE') {
         const urls = resp.Pipeline?.IngestEndpointUrls || [];
         cfg.ingestEndpoints = urls;
-        spinner.succeed('Pipeline is active');
+        anim.stop();
+        spinner.succeed(`Pipeline is active (${fmtElapsed(Math.round((Date.now() - start) / 1000))})`);
         for (const url of urls) {
           printInfo(`Ingestion endpoint: https://${url}`);
         }
@@ -553,7 +582,8 @@ export async function createOsiPipeline(cfg, pipelineYaml) {
       }
       if (status === 'CREATE_FAILED') {
         const reason = resp.Pipeline?.StatusReason?.Description || 'unknown';
-        spinner.fail('Pipeline creation failed');
+        anim.stop();
+        spinner.fail(`Pipeline creation failed (${fmtElapsed(Math.round((Date.now() - start) / 1000))})`);
         printInfo(`Reason: ${reason}`);
         throw new Error(`Pipeline creation failed: ${reason}`);
       }
@@ -561,11 +591,11 @@ export async function createOsiPipeline(cfg, pipelineYaml) {
       if (err.message?.startsWith('Pipeline creation failed')) throw err;
       /* keep polling */
     }
-    await sleepWithTicker(10_000, spinner, start,
-      (s) => `Waiting for pipeline... (${fmtElapsed(s)})`);
+    await sleep(10_000);
   }
 
-  spinner.fail('Timed out waiting for pipeline after 15 minutes');
+  anim.stop();
+  spinner.fail(`Timed out waiting for pipeline (${fmtElapsed(Math.round((Date.now() - start) / 1000))})`);
   throw new Error(`Pipeline '${cfg.pipelineName}' did not become active within 15 minutes`);
 }
 
@@ -599,23 +629,23 @@ export async function setupDashboards(cfg) {
   printSuccess(`URL: ${cfg.dashboardsUrl}`);
 }
 
-// ── Direct Query Data Source (AMP → OpenSearch) ─────────────────────────────
+// ── Connected Data Source (AMP → OpenSearch) ────────────────────────────────
 
 /**
- * Create an IAM role for the Direct Query Service to access AMP.
+ * Create an IAM role for the Connected Data Source to access AMP.
  * Trust policy allows directquery.opensearchservice.amazonaws.com to assume it.
  */
-export async function createDqsPrometheusRole(cfg) {
-  const roleName = cfg.dqsRoleName;
-  printStep(`Creating DQS Prometheus role '${roleName}'...`);
+export async function createConnectedDataSourceRole(cfg) {
+  const roleName = cfg.connectedDataSourceRoleName;
+  printStep(`Creating Connected Data Source Prometheus role '${roleName}'...`);
 
   const client = new IAMClient({ region: cfg.region });
 
   // Check if role already exists
   try {
     const existing = await client.send(new GetRoleCommand({ RoleName: roleName }));
-    cfg.dqsRoleArn = existing.Role.Arn;
-    printSuccess(`DQS role already exists: ${cfg.dqsRoleArn}`);
+    cfg.connectedDataSourceRoleArn = existing.Role.Arn;
+    printSuccess(`Connected Data Source role already exists: ${cfg.connectedDataSourceRoleArn}`);
     return;
   } catch (err) {
     if (err.name !== 'NoSuchEntityException') throw err;
@@ -636,13 +666,13 @@ export async function createDqsPrometheusRole(cfg) {
       AssumeRolePolicyDocument: trustPolicy,
       Tags: stackTags(cfg.pipelineName),
     }));
-    cfg.dqsRoleArn = result.Role.Arn;
-    printSuccess(`DQS role created: ${cfg.dqsRoleArn}`);
+    cfg.connectedDataSourceRoleArn = result.Role.Arn;
+    printSuccess(`Connected Data Source role created: ${cfg.connectedDataSourceRoleArn}`);
   } catch (err) {
-    printError('Failed to create DQS Prometheus role');
+    printError('Failed to create Connected Data Source Prometheus role');
     console.error(`  ${chalk.dim(err.message)}`);
     console.error();
-    throw new Error('Failed to create DQS Prometheus role');
+    throw new Error('Failed to create Connected Data Source Prometheus role');
   }
 
   // Attach APS access policy
@@ -658,24 +688,24 @@ export async function createDqsPrometheusRole(cfg) {
       PolicyName: 'APSAccess',
       PolicyDocument: permissionsPolicy,
     }));
-    printSuccess('APS access policy attached to DQS role');
+    printSuccess('APS access policy attached to Connected Data Source role');
   } catch (err) {
-    printError('Failed to attach APS policy to DQS role');
+    printError('Failed to attach APS policy to Connected Data Source role');
     console.error(`  ${chalk.dim(err.message)}`);
     console.error();
-    throw new Error('Failed to attach APS policy to DQS role');
+    throw new Error('Failed to attach APS policy to Connected Data Source role');
   }
 
   await sleep(5000);
 }
 
 /**
- * Create a Direct Query Data Source connecting OpenSearch to AMP (Prometheus).
+ * Create a Connected Data Source connecting OpenSearch to AMP (Prometheus).
  * Uses the OpenSearch service control plane API.
  */
-export async function createDirectQueryDataSource(cfg) {
-  const dataSourceName = cfg.dqsDataSourceName;
-  printStep(`Creating Direct Query data source '${dataSourceName}'...`);
+export async function createConnectedDataSource(cfg) {
+  const dataSourceName = cfg.connectedDataSourceName;
+  printStep(`Creating Connected Data Source '${dataSourceName}'...`);
 
   const client = new OpenSearchClient({ region: cfg.region });
   const workspaceArn = `arn:aws:aps:${cfg.region}:${cfg.accountId}:workspace/${cfg.apsWorkspaceId}`;
@@ -685,32 +715,32 @@ export async function createDirectQueryDataSource(cfg) {
       DataSourceName: dataSourceName,
       DataSourceType: {
         Prometheus: {
-          RoleArn: cfg.dqsRoleArn,
+          RoleArn: cfg.connectedDataSourceRoleArn,
           WorkspaceArn: workspaceArn,
         },
       },
       Description: `Prometheus data source for ${cfg.pipelineName} observability stack`,
     }));
-    cfg.dqsDataSourceArn = result.DataSourceArn;
-    printSuccess(`Direct Query data source created: ${cfg.dqsDataSourceArn}`);
-    await tagResource(cfg.region, cfg.dqsDataSourceArn, cfg.pipelineName);
+    cfg.connectedDataSourceArn = result.DataSourceArn;
+    printSuccess(`Connected Data Source created: ${cfg.connectedDataSourceArn}`);
+    await tagResource(cfg.region, cfg.connectedDataSourceArn, cfg.pipelineName);
   } catch (err) {
     // Treat "already exists" as success
     if (/already exists/i.test(err.message) || err.name === 'ResourceAlreadyExistsException') {
-      cfg.dqsDataSourceArn = `arn:aws:opensearch:${cfg.region}:${cfg.accountId}:datasource/${dataSourceName}`;
+      cfg.connectedDataSourceArn = `arn:aws:opensearch:${cfg.region}:${cfg.accountId}:datasource/${dataSourceName}`;
       printSuccess(`Data source '${dataSourceName}' already exists`);
       return;
     }
-    printError('Failed to create Direct Query data source');
+    printError('Failed to create Connected Data Source');
     console.error(`  ${chalk.dim(err.message)}`);
     console.error();
-    throw new Error('Failed to create Direct Query data source');
+    throw new Error('Failed to create Connected Data Source');
   }
 }
 
 /**
  * Create an OpenSearch Application (the new OpenSearch UI) and associate
- * the OpenSearch domain/collection and the DQS data source with it.
+ * the OpenSearch domain/collection and the Connected Data Source with it.
  */
 export async function createOpenSearchApplication(cfg) {
   const appName = cfg.appName;
@@ -797,7 +827,7 @@ async function fetchAppEndpoint(client, cfg) {
 function buildAppDataSources(cfg) {
   const dataSources = [];
   // Derive the domain name from the endpoint URL if reusing,
-  // otherwise use cfg.osDomainName (which may be set by applySimpleDefaults)
+  // otherwise use cfg.osDomainName (which may be set by applyQuickDefaults)
   let domainName = cfg.osDomainName;
   if (cfg.opensearchEndpoint && cfg.osAction === 'reuse') {
     const m = cfg.opensearchEndpoint.match(/search-(.+?)-[a-z0-9]+\.[a-z0-9-]+\.es\.amazonaws\.com/);
@@ -808,14 +838,14 @@ function buildAppDataSources(cfg) {
       dataSourceArn: `arn:aws:es:${cfg.region}:${cfg.accountId}:domain/${domainName}`,
     });
   }
-  if (cfg.dqsDataSourceArn) {
-    dataSources.push({ dataSourceArn: cfg.dqsDataSourceArn });
+  if (cfg.connectedDataSourceArn) {
+    dataSources.push({ dataSourceArn: cfg.connectedDataSourceArn });
   }
   return dataSources;
 }
 
 /**
- * Associate the OpenSearch domain and DQS data source with the application.
+ * Associate the OpenSearch domain and Connected Data Source with the application.
  */
 async function associateDataSourcesWithApp(cfg, client) {
   if (!cfg.appId) return;
@@ -848,15 +878,17 @@ export async function listDomains(region) {
     const { DomainNames } = await client.send(new ListDomainNamesCommand({}));
     if (DomainNames?.length) {
       const names = DomainNames.map((d) => d.DomainName);
-      const { DomainStatusList } = await client.send(
-        new DescribeDomainsCommand({ DomainNames: names }),
-      );
-      for (const d of DomainStatusList || []) {
-        results.push({
-          name: d.DomainName,
-          endpoint: d.Endpoint ? `https://${d.Endpoint}` : '',
-          engineVersion: d.EngineVersion || '',
-        });
+      for (let j = 0; j < names.length; j += 5) {
+        const { DomainStatusList } = await client.send(
+          new DescribeDomainsCommand({ DomainNames: names.slice(j, j + 5) }),
+        );
+        for (const d of DomainStatusList || []) {
+          results.push({
+            name: d.DomainName,
+            endpoint: d.Endpoint ? `https://${d.Endpoint}` : '',
+            engineVersion: d.EngineVersion || '',
+          });
+        }
       }
     }
   } catch { /* listing failed */ }

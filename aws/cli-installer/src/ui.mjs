@@ -37,6 +37,13 @@ const BOX = {
   ltee: '\u251C', rtee: '\u2524',
 };
 
+// ── OSC 8 clickable hyperlinks ───────────────────────────────────────────────
+
+/** Wrap text in an OSC 8 hyperlink escape sequence (clickable in supported terminals). */
+export function link(url, text) {
+  return `\x1B]8;;${url}\x07${text ?? url}\x1B]8;;\x07`;
+}
+
 // ── Box-drawing primitives ───────────────────────────────────────────────────
 
 /**
@@ -52,8 +59,8 @@ export function renderBox(lines, opts = {}) {
   const pad = opts.padding ?? 1;
   const sp = ' '.repeat(pad);
 
-  // Strip ANSI for width calculation
-  const stripAnsi = (s) => s.replace(/\x1B\[[0-9;]*m/g, '');
+  // Strip ANSI (SGR + OSC 8 hyperlinks) for width calculation
+  const stripAnsi = (s) => s.replace(/\x1B\][^\x07]*\x07|\x1B\[[0-9;]*m/g, '');
   const innerWidth = opts.width || Math.max(...lines.filter((l) => typeof l === 'string').map((l) => stripAnsi(l).length)) + pad * 2;
 
   const colorFn = opts.color === 'dim' ? chalk.dim
@@ -105,14 +112,33 @@ export function printBox(lines, opts = {}) {
  * @param {Array<[string, string]>} entries - [label, value] pairs; empty label = blank line
  */
 export function printPanel(title, entries) {
-  const lines = [];
+  const stripAnsi = (s) => s.replace(/\x1B\][^\x07]*\x07|\x1B\[[0-9;]*m/g, '');
+
+  // Split entries into sections (separated by blank lines or header-only rows)
+  const sections = [];
+  let cur = [];
   for (const [label, value] of entries) {
-    if (!label && !value) {
-      lines.push('');
-    } else if (!label) {
-      lines.push(value);
+    if ((!label && !value) || (!label && value)) {
+      if (cur.length) sections.push(cur);
+      cur = [];
+      sections.push([[label, value]]);
     } else {
-      lines.push(`${theme.muted(label)}  ${value}`);
+      cur.push([label, value]);
+    }
+  }
+  if (cur.length) sections.push(cur);
+
+  const lines = [];
+  for (const section of sections) {
+    if (section.length === 1 && !section[0][0]) {
+      const [, value] = section[0];
+      lines.push(value || '');
+      continue;
+    }
+    const maxLen = Math.max(...section.map(([l]) => stripAnsi(l).length));
+    for (const [label, value] of section) {
+      const padded = label + ' '.repeat(maxLen - stripAnsi(label).length);
+      lines.push(`${theme.muted(padded)}  ${value}`);
     }
   }
   printBox(lines, { title, color: 'dim', padding: 1 });
@@ -299,15 +325,24 @@ export function formatDate(d) {
 export function printBanner(session) {
   console.error();
   const lines = [
-    `${theme.muted('Create and manage your observability stack on AWS')}`,
+    `${theme.muted('OpenTelemetry-native observability for services, infrastructure, and AI agents.')}`,
+    `${theme.muted('Collect and analyze traces, logs, metrics, service maps, and agent execution graphs.')}`,
+    '',
+    `${theme.muted('This installer provisions the following AWS resources:')}`,
+    `${theme.muted('  • OpenSearch Ingestion pipeline')}`,
+    `${theme.muted('  • Amazon Managed Prometheus workspace')}`,
+    `${theme.muted('  • OpenSearch, OpenSearch UI with connected data sources')}`,
+    `${theme.muted('  • IAM roles and access control policies')}`,
   ];
-  if (session) {
-    lines.push(DIVIDER);
-    lines.push(`${theme.muted('Account')}  ${session.account}`);
-    lines.push(`${theme.muted('Region')}   ${session.region}`);
-    lines.push(`${theme.muted('Identity')} ${theme.muted(session.arn)}`);
-  }
   printBox(lines, { title: 'Open Stack', color: 'primary', padding: 2 });
+  if (session) {
+    const sessionLines = [
+      `${theme.muted('Account')}  ${session.account}`,
+      `${theme.muted('Region')}   ${session.region}`,
+      `${theme.muted('Identity')} ${theme.muted(session.arn)}`,
+    ];
+    printBox(sessionLines, { title: 'Session', color: 'primary', padding: 2 });
+  }
 }
 
 // ── Horizontal divider ──────────────────────────────────────────────────────
@@ -315,6 +350,14 @@ export function printBanner(session) {
 export function printDivider() {
   console.error(`  ${theme.muted(BOX.h.repeat(60))}`);
 }
+
+// ── Terminal cursor helpers ──────────────────────────────────────────────────
+
+/** Save cursor position (DEC private mode). */
+export function saveCursor() { process.stderr.write('\x1B7'); }
+
+/** Restore saved cursor position and erase everything below it. */
+export function clearFromCursor() { process.stderr.write('\x1B8\x1B[J'); }
 
 // ── Escape-to-go-back prompt wrapper ────────────────────────────────────────
 
@@ -328,13 +371,14 @@ let _keypressInit = false;
  * @param {Function} promptFn
  */
 export function withEscape(promptFn) {
-  return (...args) => {
+  return (opts, ...rest) => {
     if (!_keypressInit && process.stdin.isTTY) {
       readline.emitKeypressEvents(process.stdin);
       _keypressInit = true;
     }
 
-    const promise = promptFn(...args);
+    opts = { ...opts, theme: { ...opts?.theme, prefix: _promptPrefix } };
+    const promise = promptFn(opts, ...rest);
     let escaped = false;
 
     const onKeypress = (_ch, key) => {
@@ -369,7 +413,7 @@ export function withEscape(promptFn) {
 export function printTable(headers, rows) {
   if (rows.length === 0) return;
 
-  const stripAnsi = (s) => String(s).replace(/\x1B\[[0-9;]*m/g, '');
+  const stripAnsi = (s) => String(s).replace(/\x1B\][^\x07]*\x07|\x1B\[[0-9;]*m/g, '');
 
   // Calculate column widths
   const widths = headers.map((h, i) =>
@@ -406,4 +450,130 @@ export function printTable(headers, rows) {
   // Bottom border
   console.error(`  ${theme.muted(BOX.bl + BOX.h.repeat(totalWidth + 2) + BOX.br)}`);
   console.error();
+}
+
+// ── ASCII Art Animations ─────────────────────────────────────────────────────
+
+// Owl searching through data — for OpenSearch domain provisioning
+const OPENSEARCH_FRAMES = [
+  [
+    '        {o,o}    ◇ searching...',
+    '        |)__)    ◇ ◇',
+    '        -"-"-    ◇ ◇ ◇',
+    '       /|   |\\              ',
+    '      ˢᵉᵃʳᶜʰⁱⁿᵍ ᵗʰᵉ ⁱⁿᵈᵉˣ ',
+  ],
+  [
+    '        {O,o}      ◈ indexing...',
+    '        |)__)      ◈ ◈',
+    '        -"-"-      ◈ ◈ ◈',
+    '       /|   |\\              ',
+    '      ˢᶜᵃⁿⁿⁱⁿᵍ ᶜˡᵘˢᵗᵉʳˢ   ',
+  ],
+  [
+    '        {o,O}        ◆ mapping...',
+    '        |)__)        ◆ ◆',
+    '        -"-"-        ◆ ◆ ◆',
+    '       /|   |\\              ',
+    '      ᵐᵃᵖᵖⁱⁿᵍ ˢʰᵃʳᵈˢ      ',
+  ],
+  [
+    '        {O,O}  ★ found it!',
+    '        |)__)  ★ ★',
+    '        -"-"-  ★ ★ ★',
+    '       /|   |\\              ',
+    '      ᵃˡᵐᵒˢᵗ ʳᵉᵃᵈʸ...     ',
+  ],
+];
+
+// Fish swimming back and forth through the pipeline
+const FISH_RIGHT = '><(((º>';
+const FISH_LEFT = '<º)))><';
+const PIPE_WIDTH = 36;
+const PIPE_CAPTIONS = [
+  'ᵈᵃᵗᵃ ᶠˡᵒʷⁱⁿᵍ ᵗʰʳᵒᵘᵍʰ',
+  'ᵇᵘⁱˡᵈⁱⁿᵍ ᵗʰᵉ ˢᵗʳᵉᵃᵐ',
+  'ᶜᵒⁿⁿᵉᶜᵗⁱⁿᵍ ⁿᵒᵈᵉˢ',
+  'ᵃˡᵐᵒˢᵗ ᵗʰᵉʳᵉ...',
+];
+
+function buildPipelineFrame(pos, goingRight) {
+  const fish = goingRight ? FISH_RIGHT : FISH_LEFT;
+  const lane = ' '.repeat(PIPE_WIDTH);
+  const row = lane.slice(0, pos) + fish + lane.slice(pos + fish.length);
+  const pipe = '═'.repeat(PIPE_WIDTH);
+  const caption = PIPE_CAPTIONS[Math.floor(pos / (PIPE_WIDTH / PIPE_CAPTIONS.length)) % PIPE_CAPTIONS.length];
+  return [
+    `  ${pipe}`,
+    `  ${row}`,
+    `  ${pipe}`,
+    `  ${caption}`,
+  ];
+}
+
+/**
+ * Create an ASCII art animator that renders frames below the spinner.
+ * Stops the spinner and takes over status display to prevent flicker.
+ * Call .start(spinner) to begin, .stop() to clean up.
+ * @param {'opensearch'|'pipeline'} type - Which animation to show
+ */
+export function createAsciiAnimation(type) {
+  const isOpenSearch = type === 'opensearch';
+  const colorFn = isOpenSearch ? theme.accent : theme.primary;
+  let timer = null;
+  let lineCount = 0;
+  let statusFn = null;
+
+  // Pipeline state
+  let fishPos = 0;
+  let goingRight = true;
+  const maxPos = PIPE_WIDTH - FISH_RIGHT.length;
+
+  // OpenSearch state
+  let osFrame = 0;
+
+  function getFrame() {
+    if (isOpenSearch) return OPENSEARCH_FRAMES[(osFrame++) % OPENSEARCH_FRAMES.length];
+    const frame = buildPipelineFrame(fishPos, goingRight);
+    if (goingRight) { fishPos++; if (fishPos >= maxPos) goingRight = false; }
+    else { fishPos--; if (fishPos <= 0) goingRight = true; }
+    return frame;
+  }
+
+  function render() {
+    if (lineCount > 0) process.stderr.write(`\x1B[${lineCount}A\x1B[J`);
+    const frame = getFrame();
+    const status = statusFn ? `  ${theme.primary('⠋')} ${statusFn()}` : '';
+    const lines = [...frame.map((l) => `  ${colorFn(l)}`), ...(status ? [status] : [])];
+    process.stderr.write(lines.join('\n') + '\n');
+    lineCount = lines.length;
+  }
+
+  function cleanup() {
+    if (timer) { clearInterval(timer); timer = null; }
+    if (lineCount > 0) { process.stderr.write(`\x1B[${lineCount}A\x1B[J`); lineCount = 0; }
+    process.removeListener('SIGINT', onSigint);
+  }
+
+  function onSigint() {
+    cleanup();
+    console.error();
+    console.error(`  ${theme.muted('Goodbye.')}`);
+    console.error();
+    process.exit(130);
+  }
+
+  return {
+    /** @param {import('ora').Ora} spinner - stops it and takes over display */
+    start(spinner) {
+      if (spinner) spinner.stop();
+      process.on('SIGINT', onSigint);
+      lineCount = 0;
+      render();
+      timer = setInterval(render, isOpenSearch ? 600 : 120);
+    },
+    /** Update the status text shown below the art */
+    setStatus(fn) { statusFn = fn; },
+    stop() { cleanup(); },
+  };
 }

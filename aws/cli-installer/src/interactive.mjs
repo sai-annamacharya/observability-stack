@@ -1,8 +1,9 @@
 import {
   printHeader, printStep, printInfo, printSubStep,
   createSpinner, theme, GoBack, eSelect, eInput,
+  saveCursor, clearFromCursor,
 } from './ui.mjs';
-import { createDefaultConfig, DEFAULTS } from './config.mjs';
+import { createDefaultConfig, DEFAULTS, DEFAULT_REGION } from './config.mjs';
 import { listDomains, listWorkspaces, listApplications } from './aws.mjs';
 
 const CUSTOM_INPUT = Symbol('custom');
@@ -32,10 +33,10 @@ async function stepMode(cfg) {
   const mode = await eSelect({
     message: 'Mode',
     choices: [
-      { name: `Simple   ${theme.muted('\u2014 creates all resources with defaults')}`, value: 'simple' },
+      { name: `Quick    ${theme.muted('\u2014 creates all resources with defaults')}`, value: 'quick' },
       { name: `Advanced ${theme.muted('\u2014 create new or reuse existing resources; tune pipeline settings')}`, value: 'advanced' },
     ],
-    default: cfg.mode || 'simple',
+    default: cfg.mode || 'quick',
   });
   if (mode === GoBack) return GoBack;
   cfg.mode = mode;
@@ -57,19 +58,19 @@ async function stepCore(cfg, session) {
   if (session) {
     cfg.region = session.region;
     cfg.accountId = session.accountId;
-    printSubStep(`Region: ${theme.accent(cfg.region)} (from session)`);
+    printSubStep(`Region: ${theme.accent(cfg.region)}`);
   } else {
     const region = await eInput({
       message: 'AWS region',
-      default: cfg.region || 'us-east-1',
+      default: cfg.region || DEFAULT_REGION,
       validate: (v) => /^[a-z]{2}-[a-z]+-\d+$/.test(v) || 'Expected format: us-east-1',
     });
     if (region === GoBack) return GoBack;
     cfg.region = region;
   }
 
-  // Simple mode: auto-derive all resources from pipeline name
-  if (cfg.mode === 'simple') {
+  // Quick mode: auto-derive all resources from pipeline name
+  if (cfg.mode === 'quick') {
     cfg.osAction = 'create';
     cfg.osDomainName = cfg.pipelineName;
     cfg.iamAction = 'create';
@@ -77,16 +78,16 @@ async function stepCore(cfg, session) {
     cfg.apsAction = 'create';
     cfg.apsWorkspaceAlias = cfg.pipelineName;
     cfg.dashboardsAction = 'create';
-    cfg.dqsRoleName = `${cfg.pipelineName}-dqs-prometheus-role`;
-    cfg.dqsDataSourceName = `${cfg.pipelineName.replace(/-/g, '_')}_prometheus`;
+    cfg.connectedDataSourceRoleName = `${cfg.pipelineName}-connected-data-source-prometheus-role`;
+    cfg.connectedDataSourceName = `${cfg.pipelineName.replace(/-/g, '_')}_prometheus`;
     cfg.appName = cfg.pipelineName;
     console.error();
     printInfo(`Will create:`);
     printSubStep(`OpenSearch domain: ${theme.accent(cfg.osDomainName)}`);
     printSubStep(`IAM role: ${theme.accent(cfg.iamRoleName)}`);
     printSubStep(`APS workspace: ${theme.accent(cfg.apsWorkspaceAlias)}`);
-    printSubStep(`DQS role: ${theme.accent(cfg.dqsRoleName)}`);
-    printSubStep(`DQS data source: ${theme.accent(cfg.dqsDataSourceName)}`);
+    printSubStep(`Connected Data Source role: ${theme.accent(cfg.connectedDataSourceRoleName)}`);
+    printSubStep(`Connected Data Source: ${theme.accent(cfg.connectedDataSourceName)}`);
     printSubStep(`OpenSearch Application: ${theme.accent(cfg.appName)}`);
   }
 }
@@ -98,6 +99,7 @@ async function stepOpenSearch(cfg) {
   console.error();
 
   while (true) {
+    saveCursor();
     const osChoice = await eSelect({
       message: 'Create new or reuse existing?',
       choices: [
@@ -127,10 +129,10 @@ async function stepOpenSearch(cfg) {
         choices.push({ name: theme.accent('Enter manually...'), value: CUSTOM_INPUT });
 
         const selected = await eSelect({ message: 'Select domain', choices });
-        if (selected === GoBack) continue;
+        if (selected === GoBack) { clearFromCursor(); continue; }
         if (selected === CUSTOM_INPUT) {
           const ep = await promptEndpoint();
-          if (ep === GoBack) continue;
+          if (ep === GoBack) { clearFromCursor(); continue; }
           cfg.opensearchEndpoint = ep;
         } else {
           cfg.opensearchEndpoint = selected.endpoint;
@@ -138,26 +140,41 @@ async function stepOpenSearch(cfg) {
       } else {
         printInfo('No domains found \u2014 enter endpoint manually');
         const ep = await promptEndpoint();
-        if (ep === GoBack) continue;
+        if (ep === GoBack) { clearFromCursor(); continue; }
         cfg.opensearchEndpoint = ep;
       }
 
-      // Prompt for master password (needed for FGAC mapping)
-      const pass = await eInput({
-        message: 'OpenSearch master password (for FGAC role mapping)',
-        validate: (v) => v.trim().length > 0 || 'Password is required to configure access',
-      });
-      if (pass === GoBack) continue;
-      cfg.opensearchPassword = pass;
+      // Try Secrets Manager first — skip prompts if password already stored
+      let smPass;
+      try { smPass = await getMasterPassword(cfg.region, cfg.pipelineName); } catch {}
+      if (smPass) {
+        cfg.opensearchUser = cfg.opensearchUser || 'admin';
+        cfg.opensearchPassword = smPass;
+        printInfo('Master password found in Secrets Manager — skipping credential prompts');
+      } else {
+        const user = await eInput({
+          message: 'OpenSearch master username',
+          default: cfg.opensearchUser || 'admin',
+        });
+        if (user === GoBack) { clearFromCursor(); continue; }
+        cfg.opensearchUser = user;
+
+        const pass = await eInput({
+          message: 'OpenSearch master password (for FGAC role mapping)',
+          validate: (v) => v.trim().length > 0 || 'Password is required to configure access',
+        });
+        if (pass === GoBack) { clearFromCursor(); continue; }
+        cfg.opensearchPassword = pass;
+      }
     } else {
       cfg.osAction = 'create';
 
       const domainName = await eInput({ message: 'Domain name', default: cfg.osDomainName || cfg.pipelineName });
-      if (domainName === GoBack) continue;
+      if (domainName === GoBack) { clearFromCursor(); continue; }
       cfg.osDomainName = domainName;
 
       const instType = await eInput({ message: 'Instance type', default: cfg.osInstanceType || DEFAULTS.osInstanceType });
-      if (instType === GoBack) continue;
+      if (instType === GoBack) { clearFromCursor(); continue; }
       cfg.osInstanceType = instType;
 
       const instCount = await eInput({
@@ -165,7 +182,7 @@ async function stepOpenSearch(cfg) {
         default: String(cfg.osInstanceCount || DEFAULTS.osInstanceCount),
         validate: (v) => /^\d+$/.test(v.trim()) && Number(v) >= 1 || 'Must be a positive integer',
       });
-      if (instCount === GoBack) continue;
+      if (instCount === GoBack) { clearFromCursor(); continue; }
       cfg.osInstanceCount = Number(instCount);
 
       const volSize = await eInput({
@@ -173,11 +190,11 @@ async function stepOpenSearch(cfg) {
         default: String(cfg.osVolumeSize || DEFAULTS.osVolumeSize),
         validate: (v) => /^\d+$/.test(v.trim()) && Number(v) >= 10 || 'Must be at least 10 GB',
       });
-      if (volSize === GoBack) continue;
+      if (volSize === GoBack) { clearFromCursor(); continue; }
       cfg.osVolumeSize = Number(volSize);
 
       const engineVer = await eInput({ message: 'Engine version', default: cfg.osEngineVersion || DEFAULTS.osEngineVersion });
-      if (engineVer === GoBack) continue;
+      if (engineVer === GoBack) { clearFromCursor(); continue; }
       cfg.osEngineVersion = engineVer;
     }
     return;
@@ -192,6 +209,7 @@ async function stepIam(cfg) {
   console.error();
 
   while (true) {
+    saveCursor();
     const iamChoice = await eSelect({
       message: 'Create new or reuse existing?',
       choices: [
@@ -205,12 +223,12 @@ async function stepIam(cfg) {
     if (iamChoice === 'reuse') {
       cfg.iamAction = 'reuse';
       const arn = await promptArn('IAM role ARN');
-      if (arn === GoBack) continue;
+      if (arn === GoBack) { clearFromCursor(); continue; }
       cfg.iamRoleArn = arn;
     } else {
       cfg.iamAction = 'create';
       const roleName = await eInput({ message: 'Role name', default: cfg.iamRoleName || `${cfg.pipelineName}-osi-role` });
-      if (roleName === GoBack) continue;
+      if (roleName === GoBack) { clearFromCursor(); continue; }
       cfg.iamRoleName = roleName;
     }
     return;
@@ -224,6 +242,7 @@ async function stepAps(cfg) {
   console.error();
 
   while (true) {
+    saveCursor();
     const apsChoice = await eSelect({
       message: 'Create new or reuse existing?',
       choices: [
@@ -252,10 +271,10 @@ async function stepAps(cfg) {
         choices.push({ name: theme.accent('Enter URL manually...'), value: CUSTOM_INPUT });
 
         const selected = await eSelect({ message: 'Select workspace', choices });
-        if (selected === GoBack) continue;
+        if (selected === GoBack) { clearFromCursor(); continue; }
         if (selected === CUSTOM_INPUT) {
           const url = await promptUrl('Prometheus remote-write URL');
-          if (url === GoBack) continue;
+          if (url === GoBack) { clearFromCursor(); continue; }
           cfg.prometheusUrl = url;
         } else {
           cfg.prometheusUrl = selected;
@@ -263,27 +282,28 @@ async function stepAps(cfg) {
       } else {
         printInfo('No workspaces found \u2014 enter URL manually');
         const url = await promptUrl('Prometheus remote-write URL');
-        if (url === GoBack) continue;
+        if (url === GoBack) { clearFromCursor(); continue; }
         cfg.prometheusUrl = url;
       }
     } else {
       cfg.apsAction = 'create';
       const alias = await eInput({ message: 'Workspace alias', default: cfg.apsWorkspaceAlias || cfg.pipelineName });
-      if (alias === GoBack) continue;
+      if (alias === GoBack) { clearFromCursor(); continue; }
       cfg.apsWorkspaceAlias = alias;
     }
     return;
   }
 }
 
-async function stepDqsRole(cfg) {
+async function stepConnectedDataSourceRole(cfg) {
   if (cfg.mode !== 'advanced') return 'skip';
 
-  printStep('Direct Query IAM role');
-  printInfo('This role allows OpenSearch to query Prometheus metrics via Direct Query Service');
+  printStep('Connected Data Source IAM role');
+  printInfo('This role allows OpenSearch to query Prometheus metrics via Connected Data Source');
   console.error();
 
   while (true) {
+    saveCursor();
     const choice = await eSelect({
       message: 'Create new or reuse existing?',
       choices: [
@@ -295,38 +315,38 @@ async function stepDqsRole(cfg) {
     if (choice === GoBack) return GoBack;
 
     if (choice === 'reuse') {
-      const arn = await promptArn('DQS role ARN');
-      if (arn === GoBack) continue;
-      cfg.dqsRoleArn = arn;
-      cfg.dqsRoleName = '';
+      const arn = await promptArn('Connected Data Source role ARN');
+      if (arn === GoBack) { clearFromCursor(); continue; }
+      cfg.connectedDataSourceRoleArn = arn;
+      cfg.connectedDataSourceRoleName = '';
     } else {
       const roleName = await eInput({
-        message: 'DQS role name',
-        default: cfg.dqsRoleName || `${cfg.pipelineName}-dqs-prometheus-role`,
+        message: 'Connected Data Source role name',
+        default: cfg.connectedDataSourceRoleName || `${cfg.pipelineName}-connected-data-source-prometheus-role`,
       });
-      if (roleName === GoBack) continue;
-      cfg.dqsRoleName = roleName;
+      if (roleName === GoBack) { clearFromCursor(); continue; }
+      cfg.connectedDataSourceRoleName = roleName;
     }
     return;
   }
 }
 
-async function stepDqsDataSource(cfg) {
+async function stepConnectedDataSource(cfg) {
   if (cfg.mode !== 'advanced') return 'skip';
-  // Skip if no DQS role was configured
-  if (!cfg.dqsRoleName && !cfg.dqsRoleArn) return 'skip';
+  // Skip if no Connected Data Source role was configured
+  if (!cfg.connectedDataSourceRoleName && !cfg.connectedDataSourceRoleArn) return 'skip';
 
-  printStep('Direct Query data source');
+  printStep('Connected Data Source');
   printInfo('Connects OpenSearch to Prometheus so you can query metrics from OpenSearch UI');
   console.error();
 
   const dsName = await eInput({
     message: 'Data source name',
-    default: cfg.dqsDataSourceName || `${cfg.pipelineName.replace(/-/g, '_')}_prometheus`,
+    default: cfg.connectedDataSourceName || `${cfg.pipelineName.replace(/-/g, '_')}_prometheus`,
     validate: (v) => /^[a-z][a-z0-9_]+$/.test(v.trim()) || 'Must match [a-z][a-z0-9_]+ (lowercase, underscores only)',
   });
   if (dsName === GoBack) return GoBack;
-  cfg.dqsDataSourceName = dsName;
+  cfg.connectedDataSourceName = dsName;
 }
 
 async function stepApp(cfg) {
@@ -337,6 +357,7 @@ async function stepApp(cfg) {
   console.error();
 
   while (true) {
+    saveCursor();
     const choice = await eSelect({
       message: 'Create new or reuse existing?',
       choices: [
@@ -365,10 +386,10 @@ async function stepApp(cfg) {
         choices.push({ name: theme.accent('Enter URL manually...'), value: CUSTOM_INPUT });
 
         const selected = await eSelect({ message: 'Select application', choices });
-        if (selected === GoBack) continue;
+        if (selected === GoBack) { clearFromCursor(); continue; }
         if (selected === CUSTOM_INPUT) {
           const url = await promptUrl('OpenSearch UI URL');
-          if (url === GoBack) continue;
+          if (url === GoBack) { clearFromCursor(); continue; }
           cfg.dashboardsUrl = url;
         } else {
           cfg.dashboardsUrl = selected;
@@ -376,7 +397,7 @@ async function stepApp(cfg) {
       } else {
         printInfo('No applications found \u2014 enter URL manually');
         const url = await promptUrl('OpenSearch UI URL');
-        if (url === GoBack) continue;
+        if (url === GoBack) { clearFromCursor(); continue; }
         cfg.dashboardsUrl = url;
       }
       cfg.appName = '';
@@ -386,7 +407,7 @@ async function stepApp(cfg) {
         message: 'Application name',
         default: cfg.appName || cfg.pipelineName,
       });
-      if (appName === GoBack) continue;
+      if (appName === GoBack) { clearFromCursor(); continue; }
       cfg.appName = appName;
     }
     return;
@@ -420,6 +441,22 @@ async function stepTuning(cfg) {
   cfg.serviceMapWindow = window;
 }
 
+async function stepDemo(cfg) {
+  printStep('Demo workloads');
+  console.error();
+
+  const demo = await eSelect({
+    message: 'Launch EC2 demo instance with sample logs, traces & metrics?',
+    choices: [
+      { name: `Yes ${theme.muted('— sends demo telemetry to the pipeline')}`, value: true },
+      { name: 'No', value: false },
+    ],
+    default: false,
+  });
+  if (demo === GoBack) return GoBack;
+  cfg.skipDemo = !demo;
+}
+
 // ── Main wizard ──────────────────────────────────────────────────────────────
 
 /**
@@ -432,14 +469,16 @@ export async function runCreateWizard(session = null) {
 
   if (!session) printHeader();
 
-  const steps = [stepMode, stepCore, stepOpenSearch, stepIam, stepAps, stepDqsRole, stepDqsDataSource, stepApp, stepTuning];
+  const steps = [stepMode, stepCore, stepOpenSearch, stepIam, stepAps, stepConnectedDataSourceRole, stepConnectedDataSource, stepApp, stepTuning, stepDemo];
   const visited = [];
   let i = 0;
 
   while (i < steps.length) {
+    saveCursor();
     const result = await steps[i](cfg, session);
 
     if (result === GoBack) {
+      clearFromCursor();
       if (visited.length === 0) {
         // Escape at first step → return to menu
         return GoBack;

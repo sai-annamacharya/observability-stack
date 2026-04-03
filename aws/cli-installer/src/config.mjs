@@ -1,6 +1,8 @@
 /**
  * Default configuration values.
  */
+export const DEFAULT_REGION = process.env.AWS_DEFAULT_REGION || process.env.AWS_REGION || 'us-east-2';
+
 export const DEFAULTS = {
   pipelineName: `obs-stack-${Math.floor(Date.now() / 1000)}`,
   osInstanceType: 'r6g.large.search',
@@ -22,6 +24,8 @@ export function createDefaultConfig() {
     region: '',
     osAction: '',
     opensearchEndpoint: '',
+    opensearchUser: 'admin',
+    opensearchPassword: '',
     osDomainName: '',
     osInstanceType: DEFAULTS.osInstanceType,
     osInstanceCount: DEFAULTS.osInstanceCount,
@@ -39,16 +43,17 @@ export function createDefaultConfig() {
     serviceMapWindow: DEFAULTS.serviceMapWindow,
     dashboardsAction: '',
     dashboardsUrl: '',
-    dqsRoleName: '',
-    dqsRoleArn: '',
-    dqsDataSourceName: '',
-    dqsDataSourceArn: '',
+    connectedDataSourceRoleName: '',
+    connectedDataSourceRoleArn: '',
+    connectedDataSourceName: '',
+    connectedDataSourceArn: '',
     appName: '',
     appId: '',
     appEndpoint: '',
     ingestEndpoints: [],
     outputFile: '',
     dryRun: false,
+    skipDemo: false,
     accountId: '',
   };
 }
