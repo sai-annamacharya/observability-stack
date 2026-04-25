@@ -13,6 +13,7 @@ REPO_URL="https://github.com/opensearch-project/observability-stack.git"
 TEMP_DIR=$(mktemp -d)
 SIMULATE_MODE=false
 SKIP_PULL=false
+SKIP_CLONE=false
 OPENSEARCH_PROTOCOL=""
 OPENSEARCH_HOST=""
 OPENSEARCH_PORT=""
@@ -118,12 +119,14 @@ Usage: install.sh [OPTIONS]
 Options:
   --deployment-target=TARGET  Deployment target: local (default) or aws
   --simulate                  Preview the installer output without actually installing
+    --skip-clone                Skip repository clone and use current directory
   --skip-pull                 Skip building and pulling container images (uses cached images)
   --help                      Show this help message
 
 Examples:
   curl -fsSL https://raw.githubusercontent.com/.../install.sh | bash
   ./install.sh --simulate
+    ./install.sh --skip-clone
   ./install.sh --skip-pull
 
   # AWS managed stack deployment
@@ -148,6 +151,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --skip-pull)
             SKIP_PULL=true
+            shift
+            ;;
+        --skip-clone)
+            SKIP_CLONE=true
             shift
             ;;
         --deployment-target=*)
@@ -374,6 +381,19 @@ configure_installation() {
 # Clone repository
 clone_repository() {
     CURRENT_STEP="Cloning repository"
+
+    if [ "$SKIP_CLONE" = true ]; then
+        print_step "Skipping repository clone (--skip-clone)"
+        INSTALL_DIR="$(pwd)"
+        if [ ! -f "$INSTALL_DIR/docker-compose.yml" ] || [ ! -f "$INSTALL_DIR/.env" ]; then
+            print_error "Current directory does not look like observability-stack: $INSTALL_DIR"
+            print_info "Run from the repository root or remove --skip-clone"
+            exit 1
+        fi
+        print_success "Using existing repository at $INSTALL_DIR"
+        return
+    fi
+
     print_step "Cloning Observability Stack repository..."
     
     # Convert to absolute path
@@ -976,7 +996,15 @@ main() {
 # Run manual installer
 run_manual_installer() {
     check_requirements
-    configure_installation
+    if [ "$SKIP_CLONE" = true ]; then
+        INSTALL_DIR="$(pwd)"
+        INCLUDE_EXAMPLES="Y"
+        INCLUDE_OTEL_DEMO="Y"
+        OPENSEARCH_USER="admin"
+        OPENSEARCH_PASSWORD="My_password_123!@#"
+    else
+        configure_installation
+    fi
     clone_repository
     configure_environment
     load_env_config
